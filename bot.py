@@ -359,7 +359,84 @@ def perform_download(
 # User UI
 # ---------------------------------------------------------------------------
 
-def quality_keyboard(token: str) -> InlineKeyboardMarkup:
+# ---------------------------------------------------------------------------
+# Media type detection
+# ---------------------------------------------------------------------------
+
+def _has_video_format(info: dict | None) -> bool:
+    if not info:
+        return False
+    formats = info.get("formats") or []
+    for fmt in formats:
+        vcodec = fmt.get("vcodec")
+        ext = str(fmt.get("ext") or "").lower()
+        if vcodec and vcodec != "none":
+            return True
+        if ext in {"mp4", "webm", "mkv", "mov", "flv", "avi"} and fmt.get("vcodec") != "none":
+            return True
+    return False
+
+
+def _has_audio_format(info: dict | None) -> bool:
+    if not info:
+        return False
+    formats = info.get("formats") or []
+    return any(
+        (fmt.get("acodec") and fmt.get("acodec") != "none")
+        for fmt in formats
+    )
+
+
+def detect_media_type(url: str) -> str:
+    """Return 'image', 'video', or 'unknown' without downloading media."""
+    parsed = urlparse(url)
+    path_ext = Path(parsed.path).suffix.lower()
+    if path_ext in IMAGE_EXTS:
+        return "image"
+
+    try:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extract_flat": False,
+            "socket_timeout": 20,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        entries = info.get("entries") if isinstance(info, dict) else None
+        if entries:
+            entries = [e for e in entries if e]
+            # A carousel can contain a mixture. If any entry is video, expose
+            # video controls; image-only entries should remain image controls.
+            if any(_has_video_format(e) for e in entries):
+                return "video"
+            if entries and all(not _has_video_format(e) for e in entries):
+                return "image"
+
+        if _has_video_format(info):
+            return "video"
+
+        # Instagram image posts frequently expose a thumbnail/image URL but
+        # no video formats. Do not show video/audio controls in this case.
+        if is_instagram(url):
+            if info.get("formats") or info.get("thumbnail") or info.get("url"):
+                return "image"
+    except Exception as exc:
+        logger.info("Media type detection failed for %s: %s", url, exc)
+
+    return "unknown"
+
+
+def image_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🖼 Download image", callback_data=f"i|{token}")]]
+    )
+
+
+def video_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
@@ -374,7 +451,6 @@ def quality_keyboard(token: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     track_user(update)
@@ -434,18 +510,85 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     token = uuid.uuid4().hex[:10]
+    media_type = await asyncio.to_thread(detect_media_type, url)
+
     context.application.bot_data.setdefault("requests", {})[token] = {
         "url": url,
         "user_id": update.effective_user.id,
+        "media_type": media_type,
     }
 
-    await update.message.reply_text(
-        "🎯 *Choose your download option*\n\n"
-        "Video + Audio buttons include the selected maximum resolution.\n"
-        "Video only and Music are provided separately.",
-        reply_markup=quality_keyboard(token),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if media_type == "image":
+        await update.message.reply_text(
+            "🖼 *Image detected*\n\n"
+            "This link contains an image, so video/audio options are hidden.",
+            reply_markup=image_keyboard(token),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif media_type == "video":
+        await update.message.reply_text(
+            "🎯 *Video detected — choose your download option*\n\n"
+            "Video + Audio buttons use the selected maximum resolution.",
+            reply_markup=video_keyboard(token),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        # Preserve compatibility for platforms whose extractor cannot be
+        # inspected before download. Video controls remain available only when
+        # the media type is genuinely unknown.
+        await update.message.reply_text(
+            "🎯 *Choose your download option*\n\n"
+            "The media type could not be detected before download.",
+            reply_markup=video_keyboard(token),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def image_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, token = query.data.split("|", 1)
+    requests = context.application.bot_data.setdefault("requests", {})
+    request = requests.get(token)
+    if not request or request["user_id"] != query.from_user.id:
+        await query.edit_message_text("❌ This button has expired or belongs to another user.")
+        return
+
+    url = request["url"]
+    if request.get("media_type") != "image":
+        await query.edit_message_text("❌ This is not an image download request.")
+        return
+
+    await query.edit_message_text("⏳ Downloading image…")
+    tmpdir = None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="isd_img_")
+        images = await asyncio.to_thread(download_instagram_images, url, tmpdir)
+        if not images:
+            raise RuntimeError("No image could be downloaded from this link.")
+
+        sent = 0
+        for filepath in images:
+            if too_large(filepath):
+                continue
+            with open(filepath, "rb") as media:
+                await query.message.reply_photo(
+                    photo=media,
+                    caption="Downloaded via Instant Social Download" if sent == 0 else None,
+                )
+            sent += 1
+
+        if not sent:
+            raise RuntimeError("The image is too large for the configured Telegram upload limit.")
+        await query.message.reply_text("✅ Image download complete.")
+    except Exception as exc:
+        logger.exception("Image download failed")
+        await query.message.reply_text(f"❌ Image download failed: {exc}")
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        requests.pop(token, None)
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,6 +609,10 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     url = request["url"]
+    if request.get("media_type") == "image":
+        await query.edit_message_text("🖼 This is an image post. Please use the image download button.")
+        return
+
     mode = {"av": "av", "v": "video", "a": "audio"}[short_mode]
     mode_label = {"av": f"{quality}p + audio", "video": "video only", "audio": "MP3"}[short_mode]
 
@@ -704,6 +851,7 @@ def main() -> None:
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
 
+    app.add_handler(CallbackQueryHandler(image_callback, pattern=r"^i\|"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^d\|"))
     app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin\|"))
 
